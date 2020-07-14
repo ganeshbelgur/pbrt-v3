@@ -38,6 +38,7 @@
 #include "stats.h"
 #include "parallel.h"
 #include <algorithm>
+#include <fstream>
 
 STAT_TIMER("Time/BVH construction", constructionTime);
 STAT_MEMORY_COUNTER("Memory/BVH tree", treeBytes);
@@ -100,6 +101,13 @@ struct LinearBVHNode {
     uint16_t nPrimitives;  // 0 -> interior node
     uint8_t axis;          // interior node: xyz
     uint8_t pad[1];        // ensure 32 byte total size
+};
+
+struct LeafCountNode {
+    int secondChildOffset;
+    bool leafNode;
+    uint16_t leftTreeCount;
+    uint16_t rightTreeCount;
 };
 
 // BVHAccel Utility Functions
@@ -175,6 +183,56 @@ static void RadixSort(std::vector<MortonPrimitive> *v) {
     if (nPasses & 1) std::swap(*v, tempVector);
 }
 
+void printStats(const std::vector<std::shared_ptr<Primitive>> &primitives, 
+                int maxPrimsInNode,
+                LinearBVHNode const *rootNode,
+                int totalTreeNodes,
+                uint16_t totalLeafNodes) {
+    std::cout << 
+        "Maximum prims in a node " << maxPrimsInNode << std::endl;
+    std::cout << 
+        "Total number of primitives: " << primitives.size() << std::endl;
+    std::cout <<
+        "Total number of nodes in the BVH: " << totalTreeNodes << std::endl;
+    std::cout << 
+        "Total number of leaf nodes : " << 
+        totalLeafNodes <<
+        std::endl;
+
+    Point3f centroid = .5f * rootNode->bounds.pMin + .5f * rootNode->bounds.pMax;
+    std::cout << "Centroid of world/root bounding box: " << 
+        centroid.x << 
+        " " << 
+        centroid.y << 
+        " " << 
+        centroid.z << std::endl;
+
+    exit(0);
+}
+
+void generatePointCloudDataSet(const std::vector<std::shared_ptr<Primitive>> &primitives) {
+    std::cout << "Writing bounding volume data as point cloud to disk..." << std::endl;
+    std::ofstream MyFile
+    ("/home/ganesh-pc/Documents/developments/blendswap-scenes/scenes/lowpoly-bedroom/boundingBox.pcd");
+
+    for (size_t i = 0; i < primitives.size(); ++i)
+    {
+        Bounds3f bounds = primitives[i]->WorldBound();
+        Point3f centroid = .5f * bounds.pMin + .5f * bounds.pMax;
+        Float volume = (bounds.pMax.x - bounds.pMin.x) 
+                        * (bounds.pMax.y - bounds.pMin.y) 
+                        * (bounds.pMax.z - bounds.pMin.z);
+        MyFile << 
+            centroid.x << 
+            " " << centroid.y << 
+            " " << centroid.z << 
+            " " << 0.8f << "\n";
+    }
+
+    std::cout << "Point cloud data has been written to disk." << std::endl;
+    MyFile.close();
+}
+
 // BVHAccel Method Definitions
 BVHAccel::BVHAccel(const std::vector<std::shared_ptr<Primitive>> &p,
                    int maxPrimsInNode, SplitMethod splitMethod)
@@ -213,6 +271,12 @@ BVHAccel::BVHAccel(const std::vector<std::shared_ptr<Primitive>> &p,
     int offset = 0;
     flattenBVHTree(root, &offset);
     Assert(offset == totalNodes);
+
+    // Generating data set for research
+    leafCountNodes = AllocAligned<LeafCountNode>(totalNodes);
+    uint16_t totalLeafNodeCount = computeLeafCounts(0);
+    printStats(primitives, maxPrimsInNode, nodes, totalNodes, totalLeafNodeCount);
+    // generatePointCloudDataSet(primitives);
 }
 
 Bounds3f BVHAccel::WorldBound() const {
@@ -645,6 +709,76 @@ int BVHAccel::flattenBVHTree(BVHBuildNode *node, int *offset) {
 
 BVHAccel::~BVHAccel() { FreeAligned(nodes); }
 
+namespace 
+{
+// Calculates the Catalan value of 'number'
+mpz_class* C(uint16_t number)
+{
+    mpz_class *a = new mpz_class();
+    *a = number;
+    return a;
+}
+}
+
+// Finds the unique Catalan number for a given tree
+mpz_class* BVHAccel::calculateCatalanNumber(uint16_t nodeIndex, 
+                                            mpz_class *catalanNumber, 
+                                            uint16_t numberOfNodes) {
+    const LeafCountNode *node = &leafCountNodes[nodeIndex];
+
+    if (node->leftTreeCount + node->rightTreeCount < 3)
+    {
+        return 0;
+    }
+    else
+    {
+        int k = node->leftTreeCount;
+        for(int i = 1; i < k; i++)
+        {
+            *catalanNumber += *C(i-1) * *C(numberOfNodes - i -1)
+                + (*calculateCatalanNumber(nodeIndex+1, catalanNumber, k) * *C(numberOfNodes - k - 1))
+                + *calculateCatalanNumber(node->secondChildOffset, catalanNumber, node->rightTreeCount);
+        }
+    }
+
+    return catalanNumber;
+}
+
+// Pass the index of the root when the 
+// function is called the very first time
+uint16_t BVHAccel::computeLeafCounts(uint16_t nodeIndex)
+{
+    const LinearBVHNode *node = &nodes[nodeIndex];
+    LeafCountNode *leafNode = &leafCountNodes[nodeIndex];
+
+    if (node->nPrimitives > 0)
+    {
+        leafNode->leftTreeCount = 0;
+        leafNode->rightTreeCount = 0;
+        leafNode->leafNode = true;
+        leafNode->secondChildOffset = -1;
+
+        if (node->nPrimitives > 2)
+        {
+            std::cout << 
+                "Warning: Found a tree leaf node with " <<
+                node->nPrimitives <<
+                " (should be <=2) primitives!" << std::endl;
+        }
+
+        return node->nPrimitives;
+    }
+    else
+    {
+        leafNode->leftTreeCount = computeLeafCounts(nodeIndex+1);
+        leafNode->rightTreeCount = computeLeafCounts(node->secondChildOffset);
+        leafNode->leafNode = false;
+        leafNode->secondChildOffset = node->secondChildOffset;
+    }
+    
+    return leafNode->leftTreeCount + leafNode->rightTreeCount;
+}
+
 bool BVHAccel::Intersect(const Ray &ray, SurfaceInteraction *isect) const {
     if (!nodes) return false;
     ProfilePhase p(Prof::AccelIntersect);
@@ -741,6 +875,11 @@ std::shared_ptr<BVHAccel> CreateBVHAccelerator(
         splitMethod = BVHAccel::SplitMethod::SAH;
     }
 
-    int maxPrimsInNode = ps.FindOneInt("maxnodeprims", 4);
+    // Avoiding grouping of nodes in the leaves to get the right
+    // Catalan value generated for the tree generated. Hence, changing
+    // maximum nodes per prim from 4 to 1.
+    // int maxPrimsInNode = ps.FindOneInt("maxnodeprims", 4);
+    int maxPrimsInNode = ps.FindOneInt("maxnodeprims", 1);
+
     return std::make_shared<BVHAccel>(prims, maxPrimsInNode, splitMethod);
 }

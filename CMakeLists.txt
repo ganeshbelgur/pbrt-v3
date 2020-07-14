@@ -235,6 +235,11 @@ ADD_LIBRARY ( pbrt STATIC
   ${PBRT_SOURCE}
   )
 
+TARGET_LINK_LIBRARIES ( pbrt
+  -lgmpxx
+  -lgmp
+  )
+
 IF (WIN32)
   # Avoid a name clash when building on Visual Studio
   SET_TARGET_PROPERTIES ( pbrt

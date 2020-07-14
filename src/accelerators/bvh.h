@@ -42,12 +42,14 @@
 #include "pbrt.h"
 #include "primitive.h"
 #include <atomic>
+#include <gmpxx.h>
 struct BVHBuildNode;
 
 // BVHAccel Forward Declarations
 struct BVHPrimitiveInfo;
 struct MortonPrimitive;
 struct LinearBVHNode;
+struct LeafCountNode;
 
 // BVHAccel Declarations
 class BVHAccel : public Aggregate {
@@ -63,6 +65,8 @@ class BVHAccel : public Aggregate {
     ~BVHAccel();
     bool Intersect(const Ray &ray, SurfaceInteraction *isect) const;
     bool IntersectP(const Ray &ray) const;
+    std::uint16_t computeLeafCounts(uint16_t nodeIndex);
+    mpz_class* calculateCatalanNumber(uint16_t nodeIndex, mpz_class *k, uint16_t numberOfNodes);
 
   private:
     // BVHAccel Private Methods
@@ -90,6 +94,7 @@ class BVHAccel : public Aggregate {
     const SplitMethod splitMethod;
     std::vector<std::shared_ptr<Primitive>> primitives;
     LinearBVHNode *nodes = nullptr;
+    LeafCountNode *leafCountNodes = nullptr;
 };
 
 std::shared_ptr<BVHAccel> CreateBVHAccelerator(
