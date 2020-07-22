@@ -52,6 +52,8 @@ IF(MSVC)
 ENDIF()
 
 FIND_PACKAGE ( Threads )
+FIND_PACKAGE ( OpenCV )
+FIND_PACKAGE ( pybind11 REQUIRED )
 
 IF(CMAKE_BUILD_TYPE MATCHES RELEASE)
   ADD_DEFINITIONS (-DNDEBUG)
@@ -119,6 +121,10 @@ INCLUDE_DIRECTORIES (
   src/ext/openexr/OpenEXR/IlmImf
   ${CMAKE_BINARY_DIR}/src/ext/openexr/IlmBase/config
   ${CMAKE_BINARY_DIR}/src/ext/openexr/OpenEXR/config
+  ${OpenCV_INCLUDE_DIRS}
+  ${PYBIND11_INCLUDE_DIRS}
+  /usr/include/eigen3
+  /usr/include/python3.6
 )
 
 IF(WIN32)
@@ -234,6 +240,12 @@ ADD_LIBRARY ( pbrt STATIC
   ${PBRT_CORE_HEADERS}
   ${PBRT_SOURCE}
   )
+
+TARGET_LINK_LIBRARIES ( pbrt
+  ${OpenCV_LIBS}
+  ${PYBIND11_LIBS}
+  /usr/lib/python3.6/config-3.6m-x86_64-linux-gnu/libpython3.6.so
+)
 
 IF (WIN32)
   # Avoid a name clash when building on Visual Studio
