@@ -43,7 +43,6 @@
 #include <opencv2/opencv.hpp>
 #include <pybind11/embed.h>
 #include <pybind11/numpy.h>
-#include <Eigen/Dense>
 #include <pybind11/eigen.h>
 
 namespace py = pybind11;
@@ -68,6 +67,21 @@ struct CNNAgglomerativeBVHPrimitiveInfo {
     Point2i pixel;
     double volume;
     double normalized_volume;
+};
+
+struct CNNBVHNode {
+  CNNBVHNode(
+    int id,
+    Bounds3f bounds,
+    CNNBVHNode* leftChild = nullptr,
+    CNNBVHNode* rightChild = nullptr):
+    m_id(id),
+    m_bounds(bounds), m_leftChild(leftChild),
+    m_rightChild(rightChild) {}
+  int m_id;
+  Bounds3f m_bounds;
+  CNNBVHNode *m_leftChild;
+  CNNBVHNode *m_rightChild;
 };
 
 void ShowImg(
@@ -151,6 +165,34 @@ void makeSphericalProjection(
   }
 }
 
+CNNBVHNode* CNNAgglomerativeBVHAccel::toTree(
+  const Eigen::MatrixXd &dendrogram,
+  const std::vector<CNNAgglomerativeBVHPrimitiveInfo> &info,
+  int primitiveSize) {
+  m_nodes = std::vector<CNNBVHNode*>(primitiveSize * 2 - 1);
+  for(int i = 0; i < primitiveSize; ++i)
+  {
+    m_nodes[i] = new CNNBVHNode(i, info[i].bounds);
+  }
+
+  CNNBVHNode *currentRoot = nullptr;
+  for(int i = 0; i < primitiveSize-1; ++i)
+  {
+    int fi = int(dendrogram(i, 0));
+    int fj = int(dendrogram(i, 1));
+
+    currentRoot = new CNNBVHNode(
+      i + primitiveSize,
+      Union(m_nodes[fi]->m_bounds, m_nodes[fj]->m_bounds),
+      m_nodes[fi],
+      m_nodes[fj]);
+
+    m_nodes[i + primitiveSize] = currentRoot;
+  }
+
+  return currentRoot;
+}
+
 // CNNAgglomerativeBVHAccel Method Definitions
 CNNAgglomerativeBVHAccel::CNNAgglomerativeBVHAccel(
     const std::vector<std::shared_ptr<Primitive>> &p,
@@ -164,10 +206,14 @@ CNNAgglomerativeBVHAccel::CNNAgglomerativeBVHAccel(
     double max_volume = 0.0;
     std::vector<CNNAgglomerativeBVHPrimitiveInfo> 
         primitiveInfo(m_primitives.size());
+    Eigen::MatrixXd m(m_primitives.size(), 3);
     for (size_t i = 0; i < m_primitives.size(); ++i) {
         primitiveInfo[i] = {i, m_primitives[i]->WorldBound()};
         if (max_volume < primitiveInfo[i].volume)
             max_volume = primitiveInfo[i].volume;
+        m(i, 0) = primitiveInfo[i].centroid.x;
+        m(i, 1) = primitiveInfo[i].centroid.y;
+        m(i, 2) = primitiveInfo[i].centroid.z;
     }
     double inv_max_volume = 1.0 / max_volume;
     for(auto &item : primitiveInfo)
@@ -186,54 +232,95 @@ CNNAgglomerativeBVHAccel::CNNAgglomerativeBVHAccel(
         frameWidth,
         frameHeight);
 
-    Eigen::MatrixXd m(2,3);
-    m(0, 0) = 1.0f;
-    m(0, 1) = 2.0f;
-    m(0, 2) = 3.0f;
-    m(1, 0) = 4.0f;
-    m(1, 1) = 5.0f;
-    m(1, 2) = 6.0f;
+    // Prediction from the model
+    std::string distanceMode = "single";
 
+    // Binding and call to Scipy's linkage method for clustering
     py::scoped_interpreter python;
-    auto hierarchy = py::module::import("scipy.cluster.hierarchy");
-    auto dendogramStructure = hierarchy.attr("linkage")(m, py::str(std::string("ward")));
-    Eigen::MatrixXd res = dendogramStructure.cast<Eigen::MatrixXd>();
-    hierarchy.attr("dendrogram")(res);
-    auto matplotlib = py::module::import("matplotlib");
-    matplotlib.attr("pyplot").attr("show")();
+    auto hierarchy = 
+      py::module::import("scipy.cluster.hierarchy");
+    auto ddData = hierarchy.attr("linkage")(
+      m,
+      py::str(std::string(distanceMode)));
+    Eigen::MatrixXd dendrogram =
+      ddData.cast<Eigen::MatrixXd>();
 
-    std::cout << "Original data sent: " << m << std::endl;
-    std::cout << "Dendogram structure after agglomeration: " << res << std::endl;
+    // Converting dendrogram to binary tree
+    toTree(dendrogram, primitiveInfo, m_primitives.size());
+}
+
+bool CNNAgglomerativeBVHAccel::Intersect(
+  const Ray &ray,
+  SurfaceInteraction *isect) const {
+    if (!m_nodes.size()) return false;
+    bool hit = false;
+    Vector3f invDir(1 / ray.d.x, 1 / ray.d.y, 1 / ray.d.z);
+    int dirIsNeg[3] = {invDir.x < 0, invDir.y < 0, invDir.z < 0};
+    int nodesToVisit[64];
+    int toVisitOffset = 0, currentNodeIndex = 2 * (m_primitives.size() - 1);
+
+    while (true) {
+      CNNBVHNode *currentNode = m_nodes[currentNodeIndex];
+      if (currentNode->m_bounds.IntersectP(ray, invDir, dirIsNeg))
+      {
+        if (!currentNode->m_leftChild && !currentNode->m_rightChild) {
+          if (m_primitives[currentNodeIndex]->Intersect(
+                            ray, isect))
+            hit = true;
+          if (toVisitOffset == 0) break;
+          currentNodeIndex = nodesToVisit[--toVisitOffset];
+        } else {
+          currentNodeIndex = currentNode->m_leftChild->m_id;
+          nodesToVisit[toVisitOffset++] = currentNode->m_rightChild->m_id;
+        }
+      } else {
+        if (toVisitOffset == 0) break;
+        currentNodeIndex = nodesToVisit[--toVisitOffset];
+      }
+    }
+    return hit;
+}
+
+bool CNNAgglomerativeBVHAccel::IntersectP(const Ray &ray) const {
+    if (!m_nodes.size()) return false;
+    bool hit = false;
+    Vector3f invDir(1 / ray.d.x, 1 / ray.d.y, 1 / ray.d.z);
+    int dirIsNeg[3] = {invDir.x < 0, invDir.y < 0, invDir.z < 0};
+    int nodesToVisit[64];
+    int toVisitOffset = 0, currentNodeIndex = 2 * (m_primitives.size() - 1);
+
+    while (true) {
+      CNNBVHNode *currentNode = m_nodes[currentNodeIndex];
+      if (currentNode->m_bounds.IntersectP(ray, invDir, dirIsNeg))
+      {
+        if (!currentNode->m_leftChild && !currentNode->m_rightChild) {
+          if (m_primitives[currentNodeIndex]->IntersectP(
+                            ray))
+            return true;
+          if (toVisitOffset == 0) break;
+          currentNodeIndex = nodesToVisit[--toVisitOffset];
+        } else {
+          currentNodeIndex = currentNode->m_leftChild->m_id;
+          nodesToVisit[toVisitOffset++] = currentNode->m_rightChild->m_id;
+        }
+      } else {
+        if (toVisitOffset == 0) break;
+        currentNodeIndex = nodesToVisit[--toVisitOffset];
+      }
+    }
+    return false;
+}
+
+Bounds3f CNNAgglomerativeBVHAccel::WorldBound() const {
+  return !m_nodes.empty() ? 
+    m_nodes[2 * (m_primitives.size() - 1)]->m_bounds : Bounds3f();
 }
 
 CNNAgglomerativeBVHAccel::~CNNAgglomerativeBVHAccel()
 {
 }
 
-std::shared_ptr<BVHAccel> CreateCNNAgglomerativeBVHAccelerator(
+std::shared_ptr<CNNAgglomerativeBVHAccel> CreateCNNAgglomerativeBVHAccelerator(
     const std::vector<std::shared_ptr<Primitive>> &prims, const ParamSet &ps) {
-  std::shared_ptr<CNNAgglomerativeBVHAccel> cnnBVH = 
-      std::make_shared<CNNAgglomerativeBVHAccel>(prims);
-  
-  if(cnnBVH)
-    std::cout << "CNN BVH object created successfully (but still returning a BVH object)" << std::endl;
-  
-  std::string splitMethodName = ps.FindOneString("splitmethod", "sah");
-  BVHAccel::SplitMethod splitMethod;
-  if (splitMethodName == "sah")
-      splitMethod = BVHAccel::SplitMethod::SAH;
-  else if (splitMethodName == "hlbvh")
-      splitMethod = BVHAccel::SplitMethod::HLBVH;
-  else if (splitMethodName == "middle")
-      splitMethod = BVHAccel::SplitMethod::Middle;
-  else if (splitMethodName == "equal")
-      splitMethod = BVHAccel::SplitMethod::EqualCounts;
-  else {
-      Warning("BVH split method \"%s\" unknown.  Using \"sah\".",
-              splitMethodName.c_str());
-      splitMethod = BVHAccel::SplitMethod::SAH;
-  }
-
-  int maxPrimsInNode = ps.FindOneInt("maxnodeprims", 4);
-  return std::make_shared<BVHAccel>(prims, maxPrimsInNode, splitMethod);
+  return std::make_shared<CNNAgglomerativeBVHAccel>(prims);
 }

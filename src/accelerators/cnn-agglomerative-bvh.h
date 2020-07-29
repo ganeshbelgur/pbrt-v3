@@ -43,27 +43,35 @@
 #include "primitive.h"
 #include <atomic>
 
-struct LinearBVHNode;
+#include <Eigen/Dense>
+
+struct CNNBVHNode;
+struct CNNAgglomerativeBVHPrimitiveInfo;
 
 class CNNAgglomerativeBVHAccel : public Aggregate {
     public:
     CNNAgglomerativeBVHAccel(const std::vector<std::shared_ptr<Primitive>> &p,
                              int frameWidth, int frameHeight);
-    Bounds3f WorldBound() const { m_primitives[0]->WorldBound(); }
+    Bounds3f WorldBound() const;
     ~CNNAgglomerativeBVHAccel();
 
-    bool Intersect(const Ray &ray, SurfaceInteraction *isect) const { return true; }
-    bool IntersectP(const Ray &ray) const { return false; }
+    bool Intersect(const Ray &ray, SurfaceInteraction *isect) const;
+    bool IntersectP(const Ray &ray) const;
 
     private:
+    CNNBVHNode* toTree(
+      const Eigen::MatrixXd &dendrogram,
+      const std::vector<CNNAgglomerativeBVHPrimitiveInfo> &info,
+      int primitiveSize);
+
     int m_frameWidth;
     int m_frameHeight;
 
     std::vector<std::shared_ptr<Primitive>> m_primitives;
-    LinearBVHNode *m_nodes = nullptr;
+    std::vector<CNNBVHNode*> m_nodes;
 };
 
-std::shared_ptr<BVHAccel> CreateCNNAgglomerativeBVHAccelerator(
+std::shared_ptr<CNNAgglomerativeBVHAccel> CreateCNNAgglomerativeBVHAccelerator(
     const std::vector<std::shared_ptr<Primitive>> &prims, const ParamSet &ps);
 
 #endif  // PBRT_ACCELERATORS_CNN_AGGLOMERATIVE_BVH_H
